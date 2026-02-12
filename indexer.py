@@ -74,19 +74,12 @@ REPOS = [
 
 # Databricks public docs sitemap sections to scrape
 DOCS_SITEMAP_URL = "https://docs.databricks.com/aws/en/sitemap.xml"
-DOCS_SCRAPE_SECTIONS = [
-    "/aws/en/genie/",
-    "/aws/en/sql/",
-    "/aws/en/unity-catalog/",
-    "/aws/en/admin/",
-    "/aws/en/security/",
-    "/aws/en/api/",
-    "/aws/en/dev-tools/",
-    "/aws/en/machine-learning/",
-    "/aws/en/generative-ai/",
-    "/aws/en/delta/",
-    "/aws/en/warehouses/",
-    "/aws/en/workspace/",
+# Sections to skip (low-value or non-documentation content)
+DOCS_SKIP_SECTIONS = [
+    "/aws/en/archive/",
+    "/aws/en/release-notes/",
+    "/aws/en/search/",
+    "/aws/en/category/",
 ]
 DOCS_COLLECTION = "databricks_docs"
 
@@ -253,14 +246,26 @@ def chunk_text(text: str, source: str, chunk_size: int = CHUNK_SIZE, overlap: in
     # Try to split on markdown headers first
     raw_sections = re.split(r'\n(?=#{1,3}\s)', text)
 
-    # Merge small consecutive sections up to MERGE_TARGET
-    sections: list[tuple[str, str]] = []  # (section_text, section_title)
+    # Track heading hierarchy (h1 > h2 > h3) for each section
+    heading_stack = {}  # level -> title
+    sections: list[tuple[str, str, str]] = []  # (section_text, section_title, hierarchy)
     for raw_sec in raw_sections:
         raw_sec = raw_sec.strip()
         if not raw_sec:
             continue
         title_match = re.match(r'^(#{1,3})\s+(.+)', raw_sec)
         sec_title = title_match.group(2).strip() if title_match else ""
+        sec_level = len(title_match.group(1)) if title_match else 0
+
+        # Update heading stack — clear lower levels when a higher heading appears
+        if sec_level > 0:
+            heading_stack[sec_level] = sec_title
+            for lvl in list(heading_stack):
+                if lvl > sec_level:
+                    del heading_stack[lvl]
+
+        # Build hierarchy string: "H1 > H2 > H3"
+        hierarchy = " > ".join(heading_stack[lvl] for lvl in sorted(heading_stack) if heading_stack[lvl])
 
         if (
             sections
@@ -268,22 +273,22 @@ def chunk_text(text: str, source: str, chunk_size: int = CHUNK_SIZE, overlap: in
             and not sec_title  # don't merge into a new titled section
         ):
             # Merge with previous section
-            prev_text, prev_title = sections[-1]
-            sections[-1] = (prev_text + "\n\n" + raw_sec, prev_title)
+            prev_text, prev_title, prev_hier = sections[-1]
+            sections[-1] = (prev_text + "\n\n" + raw_sec, prev_title, prev_hier)
         elif (
             sections
             and len(sections[-1][0]) < 200
             and len(sections[-1][0]) + len(raw_sec) + 2 <= chunk_size
         ):
             # Previous section is very small — merge even with a new title
-            prev_text, prev_title = sections[-1]
+            prev_text, prev_title, prev_hier = sections[-1]
             merged_title = prev_title or sec_title
-            sections[-1] = (prev_text + "\n\n" + raw_sec, merged_title)
+            sections[-1] = (prev_text + "\n\n" + raw_sec, merged_title, hierarchy or prev_hier)
         else:
-            sections.append((raw_sec, sec_title))
+            sections.append((raw_sec, sec_title, hierarchy))
 
     global_chunk_idx = 0
-    for section, section_title in sections:
+    for section, section_title, hierarchy in sections:
         section = section.strip()
         if not section:
             continue
@@ -299,6 +304,7 @@ def chunk_text(text: str, source: str, chunk_size: int = CHUNK_SIZE, overlap: in
                 "text": cleaned,
                 "source": source,
                 "section": section_title,
+                "hierarchy": hierarchy,
                 "page_title": page_meta.get("page_title", ""),
                 "page_description": page_meta.get("page_description", ""),
             }
@@ -327,6 +333,7 @@ def chunk_text(text: str, source: str, chunk_size: int = CHUNK_SIZE, overlap: in
                         "text": chunk_text_str,
                         "source": source,
                         "section": section_title,
+                        "hierarchy": hierarchy,
                         "page_title": page_meta.get("page_title", ""),
                         "page_description": page_meta.get("page_description", ""),
                     }
@@ -366,6 +373,7 @@ def embed_and_store(chunks: list[dict], collection, model: SentenceTransformer):
             {
                 "source": c["source"],
                 "section": c["section"],
+                "hierarchy": c.get("hierarchy", ""),
                 "page_title": c.get("page_title", ""),
                 "page_description": c.get("page_description", ""),
             }
@@ -400,9 +408,9 @@ def scrape_databricks_docs(model: SentenceTransformer, client: chromadb.Persiste
     ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
     all_urls = [loc.text for loc in root.findall(".//sm:loc", ns) if loc.text]
 
-    # Filter to relevant sections
-    urls = [u for u in all_urls if any(section in u for section in DOCS_SCRAPE_SECTIONS)]
-    logger.info(f"Found {len(urls)} pages in target sections (from {len(all_urls)} total)")
+    # Index all pages except skipped sections
+    urls = [u for u in all_urls if not any(skip in u for skip in DOCS_SKIP_SECTIONS)]
+    logger.info(f"Found {len(urls)} pages to index (skipped {len(all_urls) - len(urls)} from excluded sections)")
 
     # No cap — index all matching pages
 
@@ -486,24 +494,30 @@ def scrape_databricks_kb(model: SentenceTransformer, client: chromadb.Persistent
 
     def _scrape_kb_page(url: str) -> list[dict]:
         try:
-            page_resp = requests.get(url, timeout=15, headers={"User-Agent": "DatabricksDocsMCP/1.0"})
+            # Use Helpjuice JSON API — append .json to get structured article data
+            json_url = url.rstrip("/") + ".json"
+            page_resp = requests.get(json_url, timeout=15, headers={"User-Agent": "DatabricksDocsMCP/1.0"})
             if page_resp.status_code != 200:
                 return []
 
-            soup = BeautifulSoup(page_resp.text, "html.parser")
+            data = page_resp.json()
+            html_body = data.get("answer") or data.get("processed_answer") or ""
+            if not html_body:
+                return []
 
-            for tag in soup.find_all(["nav", "header", "footer", "aside", "script", "style"]):
-                tag.decompose()
-
-            main = soup.find("article") or soup.find("main") or soup.body or soup
-
-            text = md(str(main), strip=["img"]).strip()
+            # Convert HTML article body to markdown
+            text = md(html_body, strip=["img"]).strip()
             if not text or len(text) < 100:
                 return []
 
+            title = data.get("name", "")
+            description = data.get("description", "")
             source = url.replace("https://kb.databricks.com/", "kb.databricks.com/")
             fallback_title = url.rstrip("/").rsplit("/", 1)[-1].replace("-", " ").title()
-            page_meta = extract_page_metadata(text, fallback_title=fallback_title)
+            page_meta = {
+                "page_title": title or fallback_title,
+                "page_description": description[:200] if description else "",
+            }
             return list(chunk_text(text, source=source, page_meta=page_meta))
 
         except Exception as e:

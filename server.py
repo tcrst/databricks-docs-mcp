@@ -9,12 +9,14 @@ Usage:
     python server.py --transport sse    # SSE (for remote clients)
 """
 
+import json
 import logging
 from pathlib import Path
 
+import requests as http_requests
 import chromadb
 from chromadb.config import Settings
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from fastmcp import FastMCP
 
 logging.basicConfig(level=logging.INFO)
@@ -55,6 +57,15 @@ def _get_device() -> str:
 _device = _get_device()
 logger.info(f"Loading embedding model: {EMBEDDING_MODEL} (device: {_device})")
 model = SentenceTransformer(EMBEDDING_MODEL, device=_device)
+
+# Cross-encoder for reranking (much more accurate than bi-encoder similarity)
+_RERANKER_DIRS = [
+    _SCRIPT_DIR / "model_cache" / "ms-marco-MiniLM-L-6-v2",
+    Path("/app/model/ms-marco-MiniLM-L-6-v2"),
+]
+_RERANKER_MODEL = next((str(d) for d in _RERANKER_DIRS if d.exists()), "cross-encoder/ms-marco-MiniLM-L-6-v2")
+logger.info(f"Loading reranker model: {_RERANKER_MODEL}")
+reranker = CrossEncoder(_RERANKER_MODEL, device=_device)
 
 logger.info("Connecting to ChromaDB...")
 client = chromadb.PersistentClient(
@@ -232,9 +243,26 @@ def _search(collection_name: str, query: str, n_results: int = DEFAULT_RESULTS,
     # Sort by boosted relevance to surface keyword-matched results
     output.sort(key=lambda x: x["boosted_relevance"], reverse=True)
 
-    # Use boosted_relevance as the display relevance and remove internal field
+    # Take top candidates for cross-encoder reranking
+    rerank_pool = output[:max(n_results * 3, 15)]
+
+    if len(rerank_pool) > 1:
+        pairs = [[query, item["content"]] for item in rerank_pool]
+        scores = reranker.predict(pairs)
+        for item, score in zip(rerank_pool, scores):
+            # Normalize cross-encoder score to 0-1 range (sigmoid-like)
+            norm_score = 1 / (1 + __import__("math").exp(-score))
+            # Blend: 60% cross-encoder, 40% bi-encoder (boosted)
+            item["relevance"] = round(0.6 * norm_score + 0.4 * item["boosted_relevance"], 3)
+        rerank_pool.sort(key=lambda x: x["relevance"], reverse=True)
+        output = rerank_pool
+    else:
+        for item in output:
+            item["relevance"] = item.pop("boosted_relevance")
+
+    # Clean up internal field
     for item in output:
-        item["relevance"] = item.pop("boosted_relevance")
+        item.pop("boosted_relevance", None)
 
     output = output[:n_results]
 
@@ -589,15 +617,70 @@ def _split_compound_query(topic: str) -> list[str]:
     return [topic]
 
 
+OLLAMA_URL = "http://localhost:11434"
+OLLAMA_MODEL = "gemma3:1b"
+
+def _ollama_available() -> bool:
+    """Check if Ollama is running."""
+    try:
+        http_requests.get(f"{OLLAMA_URL}/api/tags", timeout=1)
+        return True
+    except Exception:
+        return False
+
+_ollama_ok = _ollama_available()
+if _ollama_ok:
+    logger.info(f"Ollama available — using {OLLAMA_MODEL} for query expansion")
+else:
+    logger.info("Ollama not available — using static query expansion")
+
+
+def _expand_query_ollama(topic: str) -> list[str]:
+    """Use Ollama to generate 2-3 alternate phrasings for better search recall."""
+    try:
+        resp = http_requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": (
+                    "Rephrase this Databricks documentation search query 3 different ways. "
+                    "Return ONLY a JSON array of strings, nothing else.\n\n"
+                    f"Query: {topic}\n\nJSON array:"
+                ),
+                "stream": False,
+                "options": {"temperature": 0.3, "num_predict": 150},
+            },
+            timeout=15,
+        )
+        text = resp.json().get("response", "").strip()
+        # Strip markdown code fences if present
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        # Extract JSON array from response
+        start = text.find("[")
+        end = text.rfind("]") + 1
+        if start >= 0 and end > start:
+            variants = json.loads(text[start:end])
+            return [v.strip() for v in variants if isinstance(v, str) and v.strip()][:3]
+    except Exception as e:
+        logger.debug(f"Ollama expansion failed: {e}")
+    return []
+
+
 def _generate_query_variants(topic: str) -> list[str]:
     """Generate search query variants to improve recall.
 
-    Produces the original query plus reformulations to catch pages
-    that use different terminology.
+    Uses Ollama (if available) for LLM-powered expansion, with static
+    fallback for keyword variants.
     """
     queries = [topic]
 
-    # Strip question words for a keyword-focused variant
+    # LLM-powered expansion via Ollama
+    if _ollama_ok:
+        llm_variants = _expand_query_ollama(topic)
+        queries.extend(llm_variants)
+
+    # Static fallback: strip question words for a keyword-focused variant
     keyword_variant = topic.lower()
     for prefix in ["what is a ", "what is an ", "what is ", "how to ", "how do i ",
                    "how does ", "explain ", "what are ", "tell me about ", "describe "]:
@@ -616,7 +699,16 @@ def _generate_query_variants(topic: str) -> list[str]:
     if any(topic.lower().startswith(p) for p in ["what is", "what are", "explain", "describe"]):
         queries.append(f"{keyword_variant} overview introduction features")
 
-    return queries[:4]  # cap at 4 variants
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for q in queries:
+        q_lower = q.lower().strip()
+        if q_lower not in seen:
+            seen.add(q_lower)
+            unique.append(q)
+
+    return unique[:6]  # cap at 6 variants
 
 
 def _keyword_search(collection_name: str, keyword: str, query: str,
