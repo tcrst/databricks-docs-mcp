@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Data (too large for git — rebuild with `python indexer.py`)
+chroma_data/
+model_cache/
+
+# Cloned repos from indexer
+databricks-*/
+terraform-provider-databricks/
+
+# OS
+.DS_Store
